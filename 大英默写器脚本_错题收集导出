@@ -1,0 +1,332 @@
+// ==UserScript==
+// @name         大英默写器 - 错题自动收集
+// @namespace    http://tampermonkey.net/
+// @version      4.0
+// @description  自动收集答错的单词（英文+音标）并导出为TXT
+// @author       You
+// @match        https://eng.zjueva.net/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    let wrongWords = [];
+
+    function load() {
+        try {
+            const saved = localStorage.getItem('wrongWords_simple');
+            if (saved) wrongWords = JSON.parse(saved);
+        } catch (e) {}
+    }
+
+    function save() {
+        try {
+            localStorage.setItem('wrongWords_simple', JSON.stringify(wrongWords));
+        } catch (e) {}
+    }
+
+    load();
+
+    // ============ 提取单词 + 音标 ============
+    function extractWordAndPron() {
+        const bodyText = document.body.textContent || '';
+        const result = { word: '', pronunciation: '' };
+
+        // 1. 从 "The answer is **word**" 提取正确答案
+        const answerMatch = bodyText.match(/answer is\s*\*\*([^*]+)\*\*/i);
+        if (answerMatch) {
+            result.word = answerMatch[1].trim();
+        }
+
+        // 2. 如果没提取到，从加粗/大号文字提取
+        if (!result.word) {
+            const els = document.querySelectorAll('strong, b, .bold, .word, .vocab, h2, h3');
+            for (const el of els) {
+                const text = el.textContent.trim();
+                // 排除干扰词
+                if (/^[a-zA-Z\s\-']{2,30}$/.test(text) &&
+                    !['Wrong','The','answer','is','Correct','Your','answer','next','pre','previous'].includes(text)) {
+                    result.word = text;
+                    break;
+                }
+            }
+        }
+
+        // 3. 从错误区域提取用户填的错词（备用）
+        if (!result.word) {
+            const wrongIndex = bodyText.indexOf('Wrong!');
+            if (wrongIndex !== -1) {
+                const context = bodyText.substring(Math.max(0, wrongIndex - 100), wrongIndex + 50);
+                const match = context.match(/([a-zA-Z\s\-']{2,25})/);
+                if (match && !['Wrong','The','answer','is'].includes(match[1].trim())) {
+                    result.word = match[1].trim();
+                }
+            }
+        }
+
+        // 4. 提取音标 /xxx/
+        const pronMatch = bodyText.match(/\/([^\/]+)\//);
+        if (pronMatch) {
+            result.pronunciation = '/' + pronMatch[1] + '/';
+        }
+
+        return result;
+    }
+
+    // ============ 检测 Wrong 并收集 ============
+    let lastWord = '';
+    let lastTime = 0;
+
+    function checkAndCollect() {
+        const bodyText = document.body.textContent || '';
+        if (!bodyText.includes('Wrong!') && !bodyText.includes('The answer is')) return;
+
+        const info = extractWordAndPron();
+        if (!info.word || info.word.length < 2) return;
+
+        // 5秒内不重复收集同一个词
+        const now = Date.now();
+        if (lastWord === info.word && now - lastTime < 5000) return;
+
+        // 检查是否已存在
+        const exists = wrongWords.some(item => item.word.toLowerCase() === info.word.toLowerCase());
+        if (exists) {
+            // 更新音标（如果之前没有）
+            const existing = wrongWords.find(item => item.word.toLowerCase() === info.word.toLowerCase());
+            if (info.pronunciation && !existing.pronunciation) {
+                existing.pronunciation = info.pronunciation;
+                save();
+            }
+            return;
+        }
+
+        wrongWords.push({
+            word: info.word,
+            pronunciation: info.pronunciation || '',
+            wrongTime: new Date().toLocaleString()
+        });
+
+        save();
+        lastWord = info.word;
+        lastTime = now;
+
+        console.log('📝 收集:', info.word, info.pronunciation);
+        showToast(`✅ 已收集: ${info.word}`);
+        updateBadge();
+    }
+
+    // ============ Toast ============
+    function showToast(msg) {
+        const old = document.querySelector('.toast-simple');
+        if (old) old.remove();
+
+        const t = document.createElement('div');
+        t.className = 'toast-simple';
+        t.textContent = msg;
+        Object.assign(t.style, {
+            position: 'fixed', top: '20px', right: '20px', zIndex: '99999',
+            padding: '10px 20px', background: '#2ecc71', color: '#fff',
+            borderRadius: '8px', fontSize: '14px', fontWeight: 'bold',
+            boxShadow: '0 4px 20px rgba(0,0,0,0.3)'
+        });
+        document.body.appendChild(t);
+        setTimeout(() => { t.style.opacity = '0'; t.style.transition = 'opacity 0.5s'; setTimeout(() => t.remove(), 500); }, 2500);
+    }
+
+    // ============ 监听 ============
+    function startObserving() {
+        const observer = new MutationObserver(() => checkAndCollect());
+        observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+        setInterval(checkAndCollect, 1500);
+    }
+
+    // ============ UI ============
+    function createUI() {
+        const style = document.createElement('style');
+        style.textContent = `
+            .btn-wrong-simple {
+                position: fixed; bottom: 20px; right: 20px; z-index: 9999;
+                padding: 12px 20px; background: #e74c3c; color: #fff;
+                border: none; border-radius: 10px; font-size: 14px; font-weight: bold;
+                cursor: pointer; box-shadow: 0 4px 20px rgba(231,76,60,0.4);
+                display: flex; align-items: center; gap: 8px;
+            }
+            .btn-wrong-simple:hover { transform: scale(1.05); }
+            .btn-wrong-simple .badge {
+                background: #fff; color: #e74c3c; border-radius: 50%;
+                padding: 0 8px; font-size: 12px; min-width: 20px; text-align: center;
+            }
+            .popup-simple {
+                position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+                z-index: 10000; background: #fff; border-radius: 12px;
+                padding: 25px 30px; max-width: 500px; max-height: 70vh;
+                overflow-y: auto; box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+                display: none; min-width: 350px;
+            }
+            .popup-simple.show { display: block; }
+            .popup-simple h3 { margin: 0 0 5px 0; color: #e74c3c; border-bottom: 2px solid #e74c3c; padding-bottom: 10px; }
+            .popup-simple .info { color: #888; font-size: 13px; margin-bottom: 12px; }
+            .popup-simple .item { padding: 6px 0; border-bottom: 1px solid #f0f0f0; font-size: 14px; }
+            .popup-simple .item .w { font-weight: bold; }
+            .popup-simple .item .p { color: #888; font-size: 13px; margin-left: 6px; }
+            .popup-simple .item .t { color: #bbb; font-size: 12px; float: right; }
+            .popup-simple .btn-group { display: flex; justify-content: center; gap: 10px; margin-top: 15px; flex-wrap: wrap; }
+            .popup-simple .btn-group button { padding: 8px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: bold; }
+            .btn-dl { background: #2ecc71; color: #fff; }
+            .btn-dl:hover { background: #27ae60; }
+            .btn-cl { background: #e74c3c; color: #fff; }
+            .btn-cl:hover { background: #c0392b; }
+            .btn-close { background: #95a5a6; color: #fff; }
+            .btn-close:hover { background: #7f8c8d; }
+            .overlay-simple {
+                position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+                background: rgba(0,0,0,0.4); z-index: 9999; display: none;
+            }
+            .overlay-simple.show { display: block; }
+            .empty { color: #999; text-align: center; padding: 30px 0; }
+            .clear-confirm { color: #e74c3c; font-size: 13px; margin-top: 5px; }
+        `;
+        document.head.appendChild(style);
+
+        // 遮罩
+        const overlay = document.createElement('div');
+        overlay.className = 'overlay-simple';
+        document.body.appendChild(overlay);
+
+        // 弹窗
+        const popup = document.createElement('div');
+        popup.className = 'popup-simple';
+        popup.innerHTML = `
+            <h3>📕 错题本</h3>
+            <div class="info" id="count-info">共 0 个错题</div>
+            <div id="list"></div>
+            <div class="btn-group">
+                <button class="btn-dl" id="btn-dl">📄 导出 TXT</button>
+                <button class="btn-cl" id="btn-cl">🗑️ 清空</button>
+                <button class="btn-close" id="btn-close">关闭</button>
+            </div>
+        `;
+        document.body.appendChild(popup);
+
+        // 按钮
+        const btn = document.createElement('button');
+        btn.className = 'btn-wrong-simple';
+        btn.innerHTML = `📕 错题本 <span class="badge" id="badge">${wrongWords.length}</span>`;
+        document.body.appendChild(btn);
+
+        // ============ 事件 ============
+        btn.addEventListener('click', showPopup);
+
+        document.getElementById('btn-close').addEventListener('click', () => {
+            overlay.classList.remove('show');
+            popup.classList.remove('show');
+        });
+
+        overlay.addEventListener('click', () => {
+            overlay.classList.remove('show');
+            popup.classList.remove('show');
+        });
+
+        document.getElementById('btn-dl').addEventListener('click', download);
+
+        document.getElementById('btn-cl').addEventListener('click', () => {
+            if (confirm('确定清空所有错题吗？')) {
+                wrongWords = [];
+                save();
+                updateBadge();
+                render();
+                showToast('🗑️ 已清空');
+            }
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                overlay.classList.remove('show');
+                popup.classList.remove('show');
+            }
+        });
+
+        function updateBadge() {
+            const b = document.getElementById('badge');
+            if (b) {
+                b.textContent = wrongWords.length;
+                b.style.display = wrongWords.length > 0 ? 'inline' : 'none';
+            }
+        }
+
+        function render() {
+            const list = document.getElementById('list');
+            const info = document.getElementById('count-info');
+
+            if (wrongWords.length === 0) {
+                list.innerHTML = '<div class="empty">🎉 暂无错题</div>';
+                info.textContent = '共 0 个错题';
+                return;
+            }
+
+            list.innerHTML = wrongWords.map((item, i) =>
+                `<div class="item">
+                    <span class="w">${i+1}. ${item.word}</span>
+                    ${item.pronunciation ? `<span class="p">${item.pronunciation}</span>` : ''}
+                    <span class="t">${item.wrongTime || ''}</span>
+                </div>`
+            ).join('');
+            info.textContent = `共 ${wrongWords.length} 个错题`;
+            updateBadge();
+        }
+
+        function showPopup() {
+            render();
+            overlay.classList.add('show');
+            popup.classList.add('show');
+        }
+
+        window.updateBadge = updateBadge;
+        updateBadge();
+    }
+
+    // ============ 导出 TXT（不含时间） ============
+function download() {
+    if (wrongWords.length === 0) {
+        alert('暂无错题');
+        return;
+    }
+
+    let txt = '═══════════════════════════════════\n';
+    txt += '      📕 错题本导出\n';
+    txt += '═══════════════════════════════════\n\n';
+
+    wrongWords.forEach((item, i) => {
+        txt += `  ${String(i+1).padStart(3)}. ${item.word}`;
+        if (item.pronunciation) txt += `  ${item.pronunciation}`;
+        txt += '\n';// 只换行，不加时间
+    });
+
+    txt += '\n═══════════════════════════════════\n';
+    txt += `  共 ${wrongWords.length} 个错题\n`;
+    txt += '═══════════════════════════════════\n';
+
+    const blob = new Blob(['\uFEFF' + txt], { type: 'text/plain;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = `错题本_${new Date().toLocaleDateString().replace(/\//g, '-')}.txt`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(link.href);
+}
+
+    // ============ 启动 ============
+    startObserving();
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', createUI);
+    } else {
+        createUI();
+    }
+
+    console.log('📕 错题收集器已加载（简版）');
+    console.log(`📊 已收集 ${wrongWords.length} 个错题`);
+
+})();
